@@ -1,0 +1,159 @@
+
+import os
+import json
+import time
+import sqlite3
+import urllib.request
+import urllib.parse
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+FEED_URL = os.getenv("FEED_URL", "")
+
+MAX_PRICE = 40
+CHECK_INTERVAL = 300
+
+CLOTHING_WORDS = [
+    "tshirt", "t-shirt", "tee", "hoodie", "sweat",
+    "jacket", "veste", "pantalon", "pants", "jogging",
+    "survetement", "short", "legging", "legging",
+    "shirt", "maillot", "pull", "veste", "coat",
+    "fleece", "polaire", "windbreaker", "zip"
+]
+
+SHOE_WORDS = [
+    "sneakers", "shoes", "chaussures", "basket",
+    "air max", "tn", "air force", "boots", "bottes"
+]
+
+GOOD_CONDITIONS = [
+    "new", "neuf", "neuve", "very good",
+    "tres bon", "très bon", "excellent"
+]
+
+db = sqlite3.connect("cart3r.db")
+db.execute("""
+CREATE TABLE IF NOT EXISTS seen (
+    item_id TEXT PRIMARY KEY
+)
+""")
+db.commit()
+
+
+def send_telegram(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram non configuré.")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": "true"
+    }).encode()
+
+    try:
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=20)
+    except Exception as e:
+        print("Erreur Telegram:", e)
+
+
+def is_clothing(item):
+    title = item.get("title", "").lower()
+    category = item.get("category", "").lower()
+    text = title + " " + category
+
+    if any(word in text for word in SHOE_WORDS):
+        return False
+
+    return (
+        any(word in text for word in CLOTHING_WORDS)
+        or "clothing" in category
+        or "vetement" in category
+        or "vêtement" in category
+    )
+
+
+def is_good_condition(item):
+    condition = str(item.get("condition", "")).lower()
+    return any(word in condition for word in GOOD_CONDITIONS)
+
+
+def check_item(item):
+    item_id = str(item.get("id", ""))
+    title = item.get("title", "Article sans titre")
+    url = item.get("url", "")
+    
+    try:
+        price = float(item.get("price", 999999))
+    except (TypeError, ValueError):
+        return
+
+    if not item_id or not url:
+        return
+
+    if price > MAX_PRICE:
+        return
+
+    if not is_clothing(item):
+        return
+
+    if not is_good_condition(item):
+        return
+
+    cursor = db.execute(
+        "SELECT item_id FROM seen WHERE item_id = ?", (item_id,)
+    )
+    if cursor.fetchone():
+        return
+
+    db.execute("INSERT INTO seen VALUES (?)", (item_id,))
+    db.commit()
+
+    size = item.get("size", "Non précisée")
+    brand = item.get("brand", "Non précisée")
+    country = item.get("country", "Non précisé")
+
+    message = (
+        "🚨 NOUVELLE OPPORTUNITÉ CART3R 🚨\n\n"
+        f"👕 {title}\n"
+        f"🏷️ Marque : {brand}\n"
+        f"💶 Prix : {price:.2f} €\n"
+        f"📏 Taille : {size}\n"
+        f"🌍 Pays : {country}\n"
+        f"🔗 {url}\n\n"
+        "Vérifie l'annonce avant d'acheter !"
+    )
+
+    send_telegram(message)
+    print("Nouvelle annonce :", title)
+
+
+def scan():
+    if not FEED_URL:
+        print("En attente d'une source d'annonces autorisée.")
+        return
+
+    try:
+        request = urllib.request.Request(
+            FEED_URL,
+            headers={"User-Agent": "CART3R-Profit-Radar/1.0"}
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        items = data if isinstance(data, list) else data.get("items", [])
+
+        for item in items:
+            check_item(item)
+
+    except Exception as e:
+        print("Erreur pendant le scan :", e)
+
+
+if __name__ == "__main__":
+    send_telegram("🤖 CART3R Profit Radar est démarré !")
+    while True:
+        scan()
+        time.sleep(CHECK_INTERVAL)
