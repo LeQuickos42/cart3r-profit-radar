@@ -11,11 +11,17 @@ FEED_URL = os.getenv("FEED_URL", "")
 
 MAX_PRICE = 40
 
+PRIORITY_BRANDS = [
+    "nike",
+    "under armour"
+]
+
 CLOTHING_WORDS = [
     "tshirt", "t-shirt", "tee", "hoodie", "sweat",
     "jacket", "veste", "pantalon", "pants", "jogging",
     "short", "legging", "shirt", "maillot", "pull",
-    "coat", "fleece", "polaire", "windbreaker", "zip"
+    "coat", "fleece", "polaire", "windbreaker", "zip",
+    "tracksuit", "survetement", "survêtement"
 ]
 
 SHOE_WORDS = [
@@ -42,65 +48,95 @@ def send_telegram(message):
         print("Identifiants Telegram manquants.")
         return
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
         "disable_web_page_preview": "true"
     }).encode()
 
-    request = urllib.request.Request(url, data=data)
+    request = urllib.request.Request(api, data=data)
+
     with urllib.request.urlopen(request, timeout=20) as response:
         print(response.read().decode())
 
 
-def check_item(item):
+def calculate_score(item):
     title = str(item.get("title", "")).lower()
+    brand = str(item.get("brand", "")).lower()
     category = str(item.get("category", "")).lower()
     condition = str(item.get("condition", "")).lower()
 
-    item_id = str(item.get("id", ""))
-    url = str(item.get("url", ""))
+    text = title + " " + category
 
     try:
         price = float(item.get("price", 999999))
+        resale = float(item.get("resale_price", 0))
+        shipping = float(item.get("shipping_cost", 0))
+        fees = float(item.get("selling_fee", 0))
     except (ValueError, TypeError):
-        return
+        return None
 
-    text = title + " " + category
-
-    if not item_id or not url or price > MAX_PRICE:
-        return
-
-    if any(word in text for word in SHOE_WORDS):
-        return
+    if price <= 0 or price > MAX_PRICE:
+        return None
 
     if not any(word in text for word in CLOTHING_WORDS):
-        return
+        return None
+
+    if any(word in text for word in SHOE_WORDS):
+        return None
 
     if not any(word in condition for word in GOOD_CONDITIONS):
-        return
+        return None
+
+    if resale <= 0:
+        return None
+
+    profit = resale - price - shipping - fees
+
+    if profit <= 0:
+        return None
+
+    margin = profit / price
+
+    profit_score = min(60, profit * 2)
+    margin_score = min(25, margin * 25)
+    brand_bonus = 15 if any(
+        b in brand or b in title for b in PRIORITY_BRANDS
+    ) else 0
+
+    score = min(100, round(
+        profit_score + margin_score + brand_bonus
+    ))
+
+    return {
+        "score": score,
+        "profit": round(profit, 2),
+        "price": price,
+        "resale": resale
+    }
+
+
+def check_item(item):
+    item_id = str(item.get("id", ""))
+    url = str(item.get("url", ""))
+
+    if not item_id or not url:
+        return None
 
     if db.execute(
         "SELECT 1 FROM seen WHERE item_id = ?", (item_id,)
     ).fetchone():
-        return
+        return None
 
-    message = (
-        "🚨 NOUVELLE ANNONCE CART3R 🚨\n\n"
-        f"👕 {item.get('title', 'Sans titre')}\n"
-        f"🏷️ Marque : {item.get('brand', 'Non précisée')}\n"
-        f"💶 Prix : {price:.2f} €\n"
-        f"📏 Taille : {item.get('size', 'Non précisée')}\n"
-        f"🌍 Pays : {item.get('country', 'Non précisé')}\n"
-        f"🔗 {url}\n\n"
-        "Vérifie l'annonce avant tout achat."
-    )
+    result = calculate_score(item)
 
-    send_telegram(message)
+    if result is None:
+        return None
 
-    db.execute("INSERT INTO seen VALUES (?)", (item_id,))
-    db.commit()
+    item["_analysis"] = result
+    return item
 
 
 def main():
@@ -118,10 +154,44 @@ def main():
 
     items = data if isinstance(data, list) else data.get("items", [])
 
-    for item in items:
-        check_item(item)
+    opportunities = []
 
-    print(f"Scan terminé : {len(items)} annonces examinées.")
+    for item in items:
+        result = check_item(item)
+        if result:
+            opportunities.append(result)
+
+    opportunities.sort(
+        key=lambda x: x["_analysis"]["score"],
+        reverse=True
+    )
+
+    for item in opportunities:
+        a = item["_analysis"]
+
+        message = (
+            "🚨 CART3R PROFIT RADAR 🚨\n\n"
+            f"👕 {item.get('title', 'Sans titre')}\n"
+            f"🏷️ Marque : {item.get('brand', 'Non précisée')}\n"
+            f"💶 Achat : {a['price']:.2f} €\n"
+            f"💰 Revente estimée : {a['resale']:.2f} €\n"
+            f"📈 Bénéfice estimé : {a['profit']:.2f} €\n"
+            f"⭐ Score : {a['score']}/100\n"
+            f"📏 Taille : {item.get('size', 'Non précisée')}\n"
+            f"🌍 Pays : {item.get('country', 'Non précisé')}\n"
+            f"🔗 {item['url']}"
+        )
+
+        try:
+            send_telegram(message)
+            db.execute(
+                "INSERT INTO seen VALUES (?)", (str(item["id"]),)
+            )
+            db.commit()
+        except Exception as error:
+            print("Erreur :", error)
+
+    print(f"Scan terminé : {len(opportunities)} opportunités.")
 
 
 if __name__ == "__main__":
